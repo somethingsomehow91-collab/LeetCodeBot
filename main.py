@@ -25,6 +25,7 @@ app = FastAPI(lifespan=lifespan)
 def read_root():
     return {"status": "FastAPI app is running"}
 
-@app.head("/health")
+# Support both GET and HEAD requests for UptimeRobot
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "ok"}
