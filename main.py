@@ -25,6 +25,6 @@ app = FastAPI(lifespan=lifespan)
 def read_root():
     return {"status": "FastAPI app is running"}
 
-@app.get("/health")
+@app.head("/health")
 def health_check():
     return {"status": "ok"}
