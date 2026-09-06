@@ -53,6 +53,7 @@ import re
 import asyncio
 import random
 import threading
+import hashlib
 import time as time_module
 from datetime import datetime, date, timedelta, time
 from zoneinfo import ZoneInfo
@@ -112,6 +113,10 @@ CHALLENGE_AUTOMATION_ENABLED = os.getenv("CHALLENGE_AUTOMATION_ENABLED", "0").lo
 
 ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}  # optional
 OWNER_ID = int(os.getenv('OWNER_ID', '0'))  # your personal Telegram user_id; set in Railway Variables
+
+# Set once main() confirms whether this process's TELEGRAM_TOKEN matches the
+# token this database was first initialized with (see _check_bot_db_fingerprint).
+DB_FOREIGN_INSTANCE = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -492,6 +497,25 @@ def db_get_config(key: str) -> Optional[str]:
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
+
+
+def _check_bot_db_fingerprint(token: str) -> bool:
+    """
+    Binds this database to the TELEGRAM_TOKEN of whichever bot first
+    initializes it, so a second, unrelated deployment that happens to point
+    at the same DATABASE_URL (wrong copy-paste, shared Railway project,
+    reused .env, ...) finds out immediately instead of silently mixing or
+    overwriting someone else's group's data.
+
+    Returns True if this token matches (or is the first to claim) the DB,
+    False if a different token already owns it.
+    """
+    fingerprint = hashlib.sha256((token or "").encode("utf-8")).hexdigest()[:16]
+    bound = db_get_config("bound_bot_fingerprint")
+    if not bound:
+        db_set_config("bound_bot_fingerprint", fingerprint)
+        return True
+    return bound == fingerprint
 
 
 def db_delete_config(key: str):
@@ -985,6 +1009,20 @@ def _backup_dir() -> str:
         return custom_dir
     base_dir = os.path.dirname(DB_PATH) or "."
     return os.path.join(base_dir, "backups")
+
+
+def _table_row_counts() -> Dict[str, int]:
+    conn = db_connect()
+    cur = conn.cursor()
+    counts = {}
+    for table in ("users", "daily_stats", "config", "leaderboard", "warns", "warn_events", "seen_members", "problem_cache"):
+        try:
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
+            counts[table] = cur.fetchone()[0]
+        except Exception:
+            counts[table] = 0
+    conn.close()
+    return counts
 
 
 def collect_backup_data() -> Dict[str, Any]:
@@ -2115,8 +2153,6 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нужен .json файл бэкапа.")
         return
 
-    await update.message.reply_text("🧩 Ок, распаковываю бэкап… (не дыши)")
-
     try:
         tg_file = await context.bot.get_file(doc.file_id)
         raw = await tg_file.download_as_bytearray()
@@ -2125,6 +2161,42 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Restore read/parse failed: %s", e)
         await update.message.reply_text(f"⚠️ Не смог прочитать/распарсить JSON: {e}")
         return
+
+    confirmed = any((a or "").strip().lower() == "confirm" for a in (context.args or []))
+    if not confirmed:
+        try:
+            current_counts = _table_row_counts()
+        except Exception as e:
+            logger.exception("Restore preview failed: %s", e)
+            current_counts = {}
+        incoming = data.get("tables") if isinstance(data.get("tables"), dict) else data
+        incoming_counts = {
+            k: (len(v) if isinstance(v, list) else (len(v) if isinstance(v, dict) else 0))
+            for k, v in (incoming or {}).items()
+            if k in ("users", "daily_stats", "config", "leaderboard", "warns", "warn_events", "seen_members", "problem_cache")
+        }
+        lines = ["⚠️ Это ПОЛНОСТЬЮ заменит текущую базу файлом из этого сообщения."]
+        if DB_FOREIGN_INSTANCE:
+            lines.append(
+                "🚨 Эта база принадлежит ДРУГОМУ боту (другой TELEGRAM_TOKEN), не этому "
+                "процессу. Похоже, DATABASE_URL указывает не туда. Скорее всего ты сейчас "
+                "не в том деплое — проверь перед тем как продолжать."
+            )
+        lines.append("")
+        lines.append("Сейчас в базе:")
+        for k in ("users", "daily_stats", "config", "leaderboard", "warns", "warn_events", "seen_members", "problem_cache"):
+            lines.append(f"  {k}: {current_counts.get(k, '?')}")
+        lines.append("")
+        lines.append("В присланном файле:")
+        for k in ("users", "daily_stats", "config", "leaderboard", "warns", "warn_events", "seen_members", "problem_cache"):
+            lines.append(f"  {k}: {incoming_counts.get(k, 0)}")
+        lines.append("")
+        lines.append("Текущее состояние перед заменой автоматически уйдёт тебе бэкапом.")
+        lines.append("Если всё верно — ответь на этот же файл командой: /restore confirm")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    await update.message.reply_text("🧩 Ок, распаковываю бэкап… (не дыши)")
 
     schema_version = data.get("schema_version") or data.get("db_schema_version") or 1
     try:
@@ -3579,14 +3651,19 @@ async def startup_notice_job(context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         last_day = _get_last_report_day()
-        await context.bot.send_message(
-            chat_id=OWNER_ID,
-            text=(
-                f"🤖 Бот запущен ({_now_str()}).\n"
-                f"Последний отправленный дневной отчёт: {last_day or 'ещё ни одного'}.\n"
-                f"Авто-отчёты/напоминания: {'включены' if (CHALLENGE_AUTOMATION_ENABLED or db_get_config('report_chat_id')) else 'выключены'}."
-            ),
+        text = (
+            f"🤖 Бот запущен ({_now_str()}).\n"
+            f"Последний отправленный дневной отчёт: {last_day or 'ещё ни одного'}.\n"
+            f"Авто-отчёты/напоминания: {'включены' if (CHALLENGE_AUTOMATION_ENABLED or db_get_config('report_chat_id')) else 'выключены'}."
         )
+        if DB_FOREIGN_INSTANCE:
+            text = (
+                "⚠️ ВНИМАНИЕ: эта база данных была изначально создана ДРУГИМ ботом "
+                "(другой TELEGRAM_TOKEN). Похоже, DATABASE_URL указывает не на свою базу, "
+                "а на чужую/общую. Если это не намеренно — останови этот процесс и проверь "
+                "переменные окружения, прежде чем что-то менять/удалять.\n\n" + text
+            )
+        await context.bot.send_message(chat_id=OWNER_ID, text=text)
     except Exception as e:
         logger.exception("startup_notice_job failed: %s", e)
 
@@ -3594,6 +3671,7 @@ async def startup_notice_job(context: ContextTypes.DEFAULT_TYPE):
 
 # ----------------- Main -----------------
 def main():
+    global DB_FOREIGN_INSTANCE
     init_db()
     ensure_daily_report_time_config()
     if not acquire_singleton_lock():
@@ -3602,6 +3680,15 @@ def main():
     if not token:
         print("ERROR: set TELEGRAM_TOKEN environment variable")
         return
+
+    if not _check_bot_db_fingerprint(token):
+        DB_FOREIGN_INSTANCE = True
+        logger.warning(
+            "This TELEGRAM_TOKEN does not match the token this database was first "
+            "initialized with. This process is likely pointed at someone else's "
+            "database (wrong DATABASE_URL / reused .env). Destructive commands will "
+            "warn loudly until this is resolved."
+        )
 
     app = ApplicationBuilder().token(token).build()
 

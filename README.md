@@ -17,6 +17,8 @@ Telegram bot for a group challenge: every participant must solve at least one Le
 - If `DATABASE_URL` is set, the bot stores data in Postgres; otherwise it falls back to local SQLite.
 - Every mutating command auto-sends a JSON backup to `OWNER_ID` in Telegram (see `auto_backup`), including a safety snapshot taken *immediately before* `/restore` wipes the tables — so an accidental or wrong `/restore` is always recoverable from the owner's own DM.
 - On every start/restart, the bot pings `OWNER_ID` with its status and the date of the last sent daily report, and (if automation is on) automatically sends a missed daily report for yesterday if one wasn't sent yet. This is meant to make silent outages visible immediately instead of weeks later.
+- `/restore` now requires two steps: sending it without `confirm` shows a preview (current row counts vs. what's in the file) and does nothing destructive; only `/restore confirm` (as a reply to the same file) actually wipes and loads.
+- The database remembers which `TELEGRAM_TOKEN` first initialized it (`bound_bot_fingerprint` in `config`). If a bot process starts up with a *different* token against the same database — e.g. someone's separate deployment accidentally reusing this `DATABASE_URL` — it logs a warning, pings its own `OWNER_ID` loudly on startup, and flags the `/restore` preview, instead of silently mixing or overwriting another group's data.
 
 ## Notification Rules
 
@@ -74,3 +76,14 @@ For free hosting, Oracle Cloud Always Free is usually the most stable long-term 
 2. Look in `OWNER_ID`'s Telegram DM with the bot for a `backup_*.json` file — every mutating command and every daily report auto-sends one there, so the last working state is usually already sitting in that chat.
 3. Once the bot is back up and connected to a working database, send that `backup.json` as a Telegram document, reply to it with `/restore`, and confirm the reported `users`/`daily_stats` counts look right.
 4. Never run `/restore` against a database you're not sure is the right/empty one — it fully replaces `users`, `daily_stats`, `config`, `leaderboard`, `warns`, `warn_events`, `seen_members`, and `problem_cache`. It does take a safety snapshot of whatever was there right before wiping (also sent to `OWNER_ID`), but recovering from that is still a manual `/restore` in reverse.
+
+## Protecting the database from someone else's deployment
+
+The single most effective protection is process, not code: **never hand out `DATABASE_URL`**. Treat it like a password. If someone wants to run their own copy of this bot for their own group, give them a brand new (free) Postgres instance, not a copy of your `.env`. A second bot pointed at the same connection string can register users, wipe the leaderboard, or run `/restore` against *your* group's data without meaning to — no code-level fix removes that risk once the credential is shared.
+
+On top of that, this repo has two safeguards:
+
+- **`/restore` requires confirmation.** The first call previews current vs. incoming row counts and does nothing; only `/restore confirm` (replying to the same file) actually replaces data. This mainly guards against sending the wrong file or restoring onto the wrong deployment by mistake.
+- **Database fingerprinting.** The first bot to talk to a fresh database "claims" it by storing a hash of its `TELEGRAM_TOKEN` in `config.bound_bot_fingerprint`. If a process with a *different* token ever connects to that same database (e.g. a fork's `DATABASE_URL` was copy-pasted from yours), it logs a warning, pings its own owner on startup, and flags the `/restore` preview — so the mismatch is visible immediately instead of only after data is already gone.
+
+Neither of these stops someone who already has your `OWNER_ID`'s Telegram account or your `DATABASE_URL` directly (e.g. via `psql`) — there's no code-level defense against that, only not sharing the credential in the first place. If you do give someone push access to this repo and it auto-deploys via Railway/Render, be aware any push they make redeploys production; keep collaborators who want "their own bot" on their own fork and their own hosting project instead.
