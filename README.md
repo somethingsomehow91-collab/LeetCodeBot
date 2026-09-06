@@ -15,6 +15,8 @@ Telegram bot for a group challenge: every participant must solve at least one Le
 - Users with 3 warnings are removed from the configured group, if the bot has admin rights.
 - `/backup` and `/restore` help move the bot between servers.
 - If `DATABASE_URL` is set, the bot stores data in Postgres; otherwise it falls back to local SQLite.
+- Every mutating command auto-sends a JSON backup to `OWNER_ID` in Telegram (see `auto_backup`), including a safety snapshot taken *immediately before* `/restore` wipes the tables — so an accidental or wrong `/restore` is always recoverable from the owner's own DM.
+- On every start/restart, the bot pings `OWNER_ID` with its status and the date of the last sent daily report, and (if automation is on) automatically sends a missed daily report for yesterday if one wasn't sent yet. This is meant to make silent outages visible immediately instead of weeks later.
 
 ## Notification Rules
 
@@ -62,4 +64,13 @@ This bot uses polling, so it does not need a public HTTPS webhook URL. It can ru
 
 On Railway, attach a Postgres database to the bot service and expose its `DATABASE_URL` variable. This keeps users, daily stats, warnings, and leaderboard data outside the app container, so redeploys do not wipe the bot state.
 
+**⚠️ Railway free Trial data-loss trap:** a new Railway account starts on a Trial with a one-time $5 credit that expires 30 days after signup — not 30 days of inactivity, 30 days total. When it expires, Railway stops *all* services in the project (the bot **and** its Postgres), which looks exactly like the bot silently dying with no error message and no daily reports. Worse: Railway deletes the Postgres volume (all data) 30 days after that expiration if the account is never upgraded. **Upgrade to the Hobby plan (add a payment method) well before day 30** if you want this bot to keep running and keep its data. If the bot has gone quiet and nobody touched the code, check the Railway dashboard for a "trial expired" / offline service before assuming it's a code bug.
+
 For free hosting, Oracle Cloud Always Free is usually the most stable long-term option, but setup is more manual. A small paid VPS is simpler and more predictable.
+
+## If the bot/DB ever goes down and data looks lost
+
+1. Check Railway (or wherever it's hosted) first — an offline/removed service (billing, trial expiry, crash loop) is a far more common cause than an actual dropped database, and looks identical from inside the bot (no daily reports, commands stop responding).
+2. Look in `OWNER_ID`'s Telegram DM with the bot for a `backup_*.json` file — every mutating command and every daily report auto-sends one there, so the last working state is usually already sitting in that chat.
+3. Once the bot is back up and connected to a working database, send that `backup.json` as a Telegram document, reply to it with `/restore`, and confirm the reported `users`/`daily_stats` counts look right.
+4. Never run `/restore` against a database you're not sure is the right/empty one — it fully replaces `users`, `daily_stats`, `config`, `leaderboard`, `warns`, `warn_events`, `seen_members`, and `problem_cache`. It does take a safety snapshot of whatever was there right before wiping (also sent to `OWNER_ID`), but recovering from that is still a manual `/restore` in reverse.

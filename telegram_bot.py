@@ -2160,6 +2160,11 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Make sure schema exists
         init_db()
 
+        # Safety net: snapshot whatever is currently in the DB *before* wiping it,
+        # so an accidental/wrong /restore is always recoverable from the owner's
+        # own Telegram chat, independent of what gets loaded next.
+        await auto_backup(context, "pre_restore_safety")
+
         conn = db_connect()
         cur = conn.cursor()
 
@@ -3561,6 +3566,31 @@ async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("catchup_job failed: %s", e)
 
 
+async def startup_notice_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Run once right after the process comes up. A previous outage (crashed
+    host, expired hosting trial, dead DB connection, ...) used to go
+    completely silent: no error, no message, just no more daily reports
+    until someone happened to notice. This pings the owner every time the
+    bot (re)starts so a silent outage is visible immediately instead of
+    weeks later.
+    """
+    if not OWNER_ID:
+        return
+    try:
+        last_day = _get_last_report_day()
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                f"🤖 Бот запущен ({_now_str()}).\n"
+                f"Последний отправленный дневной отчёт: {last_day or 'ещё ни одного'}.\n"
+                f"Авто-отчёты/напоминания: {'включены' if (CHALLENGE_AUTOMATION_ENABLED or db_get_config('report_chat_id')) else 'выключены'}."
+            ),
+        )
+    except Exception as e:
+        logger.exception("startup_notice_job failed: %s", e)
+
+
 
 # ----------------- Main -----------------
 def main():
@@ -3640,9 +3670,12 @@ def main():
             h,
             m,
         )
-        logger.info("Catch-up daily reports are disabled; daily report runs only at the scheduled time")
+        app.job_queue.run_once(catchup_job, when=15, name="startup_catchup")
+        logger.info("Startup catch-up scheduled: missed yesterday's report (if any) will be sent 15s after boot")
     else:
         logger.info("Challenge automation is disabled; reminders and daily reports are not scheduled")
+
+    app.job_queue.run_once(startup_notice_job, when=3, name="startup_notice")
 
     print("Bot started. Press Ctrl-C to stop.")
     app.run_polling()
