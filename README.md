@@ -11,7 +11,7 @@ Telegram bot for a group challenge: every participant must solve at least one Le
 - `/leaderboard` ranks users by points: Easy = 1, Medium = 3, Hard = 5.
 - `/recalculate` lets admins rebuild leaderboard points from saved daily snapshots.
 - `/recheckday YYYY-MM-DD` lets admins refetch a specific day and then rebuild the leaderboard.
-- Daily report marks who solved at least one problem and applies warnings.
+- Daily report marks who solved at least one problem and applies warnings. A copy of every daily report is also DMed to `OWNER_ID` (in addition to the group), so the owner always sees it even if the group post silently fails.
 - Users with 3 warnings are removed from the configured group, if the bot has admin rights.
 - `/backup` and `/restore` help move the bot between servers.
 - If `DATABASE_URL` is set, the bot stores data in Postgres; otherwise it falls back to local SQLite.
@@ -84,6 +84,7 @@ The single most effective protection is process, not code: **never hand out `DAT
 On top of that, this repo has two safeguards:
 
 - **`/restore` requires confirmation.** The first call previews current vs. incoming row counts and does nothing; only `/restore confirm` (replying to the same file) actually replaces data. This mainly guards against sending the wrong file or restoring onto the wrong deployment by mistake.
-- **Database fingerprinting.** The first bot to talk to a fresh database "claims" it by storing a hash of its `TELEGRAM_TOKEN` in `config.bound_bot_fingerprint`. If a process with a *different* token ever connects to that same database (e.g. a fork's `DATABASE_URL` was copy-pasted from yours), it logs a warning, pings its own owner on startup, and flags the `/restore` preview — so the mismatch is visible immediately instead of only after data is already gone.
+- **Database fingerprinting.** The first bot to talk to a fresh database "claims" it by storing a hash of its `TELEGRAM_TOKEN` in `config.bound_bot_fingerprint`. If a process with a *different* token ever connects to that same database (e.g. a fork's `DATABASE_URL` was copy-pasted from yours), it logs a warning and pings its own owner on startup.
+- **`/restore` is hard-blocked on a foreign database.** If the fingerprint above doesn't match, `/restore` refuses outright — no preview, no confirm, nothing — with a message explaining the database belongs to a different bot and that this deployment should get its own Postgres instance instead. This is deliberately a full stop rather than just a warning, since a warning is easy to miss or not understand and this is exactly the mistake that wiped the DB before. Set `ALLOW_FOREIGN_RESTORE=1` only if you're certain you want to override it.
 
 Neither of these stops someone who already has your `OWNER_ID`'s Telegram account or your `DATABASE_URL` directly (e.g. via `psql`) — there's no code-level defense against that, only not sharing the credential in the first place. If you do give someone push access to this repo and it auto-deploys via Railway/Render, be aware any push they make redeploys production; keep collaborators who want "their own bot" on their own fork and their own hosting project instead.

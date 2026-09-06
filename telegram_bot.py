@@ -110,6 +110,7 @@ SEEN_MEMBER_WRITE_TTL_SECONDS = max(60, int(os.getenv("SEEN_MEMBER_WRITE_TTL_SEC
 PG_POOL_MIN_SIZE = max(0, int(os.getenv("PG_POOL_MIN_SIZE", "1")))
 PG_POOL_MAX_SIZE = max(PG_POOL_MIN_SIZE or 1, int(os.getenv("PG_POOL_MAX_SIZE", "5")))
 CHALLENGE_AUTOMATION_ENABLED = os.getenv("CHALLENGE_AUTOMATION_ENABLED", "0").lower() in ("1", "true", "yes", "on")
+ALLOW_FOREIGN_RESTORE = os.getenv("ALLOW_FOREIGN_RESTORE", "0").lower() in ("1", "true", "yes", "on")
 
 ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}  # optional
 OWNER_ID = int(os.getenv('OWNER_ID', '0'))  # your personal Telegram user_id; set in Railway Variables
@@ -2135,6 +2136,20 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Нет доступа.")
         return
 
+    if DB_FOREIGN_INSTANCE and not ALLOW_FOREIGN_RESTORE:
+        await update.message.reply_text(
+            "🚨 /restore ЗАБЛОКИРОВАН.\n\n"
+            "Эта база данных была изначально создана ДРУГИМ ботом (другой TELEGRAM_TOKEN), "
+            "не этим процессом. Похоже, DATABASE_URL этого деплоя случайно указывает на "
+            "чужую/общую базу — почти наверняка не ту, что ты думаешь.\n\n"
+            "Скорее всего у этого бота должна быть своя ОТДЕЛЬНАЯ база данных. Заведи новый "
+            "Postgres для этого деплоя и укажи его DATABASE_URL, вместо того чтобы делить "
+            "базу с другим ботом.\n\n"
+            "Если ты точно понимаешь, что делаешь, и это осознанное решение — установи "
+            "переменную окружения ALLOW_FOREIGN_RESTORE=1 и перезапусти бота."
+        )
+        return
+
     msg = update.message
     doc = None
     if msg and msg.document:
@@ -3573,6 +3588,13 @@ async def daily_report_job(
     header = f"🧾 Итог дня — {day_str}\n(цель: ≥1 задача · Easy=1, Medium=3, Hard=5)\n"
     text = header + "\n".join(report_lines) + "\n\n" + mvp_line
     await send_report_message(context, chat_id, text)
+    if OWNER_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_ID, text=text, parse_mode="HTML", disable_web_page_preview=True
+            )
+        except Exception as e:
+            logger.warning("Failed to DM daily report to OWNER_ID: %s", e)
     _set_last_report_day(day_str)
     await auto_backup(context, f"daily_report_{day_str}")
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
