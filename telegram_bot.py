@@ -81,7 +81,7 @@ from telegram.ext import (
 DB_PATH = os.getenv("DB_PATH", "leetcode_bot.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_POSTGRES = bool(DATABASE_URL)
-DB_SCHEMA_VERSION = 6
+DB_SCHEMA_VERSION = 7
 LEETCODE_GRAPHQL = "https://leetcode.com/graphql"
 TZ = ZoneInfo("Asia/Almaty")
 LEETCODE_RECENT_ACCEPTED_LIMIT = int(os.getenv("LEETCODE_RECENT_ACCEPTED_LIMIT", "100"))
@@ -482,6 +482,12 @@ def ensure_db_schema():
         db_set_config("db_schema_version", "6")
         current = 6
 
+    # v7: per-user freeze ("отставка"): NULL = tracked, otherwise the day the user was frozen
+    if current < 7:
+        db_add_column_if_missing("users", "frozen_since", "frozen_since TEXT")
+        db_set_config("db_schema_version", "7")
+        current = 7
+
 
 def db_set_config(key: str, value: str):
     conn = db_connect()
@@ -570,6 +576,32 @@ def list_users():
     return rows
 
 
+def set_user_frozen(tid: int, frozen: bool):
+    frozen_since = datetime.now(TZ).strftime("%Y-%m-%d") if frozen else None
+    conn = db_connect()
+    cur = conn.cursor()
+    db_execute(cur, "UPDATE users SET frozen_since=? WHERE telegram_id=?", (frozen_since, int(tid)))
+    conn.commit()
+    conn.close()
+
+
+def get_frozen_users() -> Dict[int, str]:
+    """telegram_id -> day the user was frozen. Frozen users are not tracked, tagged, warned or kicked."""
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id, frozen_since FROM users WHERE frozen_since IS NOT NULL")
+    rows = cur.fetchall()
+    conn.close()
+    return {int(tid): str(since) for tid, since in rows}
+
+
+def exclude_frozen(rows: List[Tuple[int, str, str]]) -> List[Tuple[int, str, str]]:
+    frozen = get_frozen_users()
+    if not frozen:
+        return rows
+    return [row for row in rows if int(row[0]) not in frozen]
+
+
 def _inactive_member_statuses() -> set:
     return {
         getattr(ChatMember, "LEFT", "left"),
@@ -605,9 +637,14 @@ async def prune_inactive_users(
     removed = []
     statuses: Dict[int, Optional[bool]] = {}
     rows_to_check = []
+    frozen = get_frozen_users()
 
     for tid, _uname, _nick in rows:
         tid_int = int(tid)
+        if tid_int in frozen:
+            # Frozen users are not tracked at all, so they are never pruned either.
+            statuses[tid_int] = True
+            continue
         cached = _membership_cache.get((int(chat_id), tid_int))
         if cached and now_ts - cached[1] < MEMBERSHIP_CACHE_TTL_SECONDS:
             statuses[tid_int] = cached[0]
@@ -1030,10 +1067,15 @@ def collect_backup_data() -> Dict[str, Any]:
     conn = db_connect()
     cur = conn.cursor()
 
-    cur.execute("SELECT telegram_id, username, leetcode_nick FROM users")
+    cur.execute("SELECT telegram_id, username, leetcode_nick, frozen_since FROM users")
     users_rows = [
-        {"telegram_id": int(tid), "username": str(uname or ""), "leetcode_nick": str(nick or "")}
-        for tid, uname, nick in cur.fetchall()
+        {
+            "telegram_id": int(tid),
+            "username": str(uname or ""),
+            "leetcode_nick": str(nick or ""),
+            "frozen_since": str(frozen_since) if frozen_since else None,
+        }
+        for tid, uname, nick, frozen_since in cur.fetchall()
     ]
 
     cur.execute("SELECT day, telegram_id, solved_count, titles_json, fetched_at FROM daily_stats")
@@ -2291,12 +2333,13 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tid = row.get("telegram_id") or row.get("tid") or row.get("id")
                 uname = row.get("username") or row.get("uname") or ""
                 nick = row.get("leetcode_nick") or row.get("nick") or row.get("leetcode") or ""
+                frozen_since = row.get("frozen_since") or None
                 if tid is None or not nick:
                     continue
                 db_execute(
                     cur,
-                    _upsert_sql("users", ["telegram_id", "username", "leetcode_nick"], ["telegram_id"]),
-                    (int(tid), str(uname), str(nick)),
+                    _upsert_sql("users", ["telegram_id", "username", "leetcode_nick", "frozen_since"], ["telegram_id"]),
+                    (int(tid), str(uname), str(nick), frozen_since),
                 )
                 users_count += 1
 
@@ -2702,6 +2745,13 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(цель: ≥1 задача · Easy=1, Medium=3, Hard=5)\n"
     )
 
+    frozen = get_frozen_users()
+    frozen_names = sorted(
+        (profile_label(uname) for tid, uname, _nick in rows if int(tid) in frozen),
+        key=str.lower,
+    )
+    rows = [row for row in rows if int(row[0]) not in frozen]
+
     today_date = datetime.now(TZ).date()
     fresh_snapshots = get_daily_snapshots(
         today_str,
@@ -2730,6 +2780,8 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [line for _pts, _cnt, _sort_name, line, _err in scored]
     text = header + "\n" + "\n".join(lines)
+    if frozen_names:
+        text += "\n\n🧊 В отставке: " + ", ".join(frozen_names)
     await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
@@ -3048,12 +3100,16 @@ async def warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     warn_counts = get_warn_counts([int(tid) for tid, _uname, _nick in rows])
+    frozen = get_frozen_users()
     result = [
-        (warn_counts.get(int(tid), 0), (uname or "").lower(), profile_label(uname))
+        (warn_counts.get(int(tid), 0), (uname or "").lower(), profile_label(uname), int(tid) in frozen)
         for tid, uname, _nick in rows
     ]
     result.sort(key=lambda item: (-item[0], item[1]))
-    lines = [f"{name} — {count}/3" for count, _sort_name, name in result]
+    lines = [
+        f"{name} — {count}/3" + (" 🧊 в отставке" if is_frozen else "")
+        for count, _sort_name, name, is_frozen in result
+    ]
     await update.message.reply_text(
         "⚠️ Предупреждения участников:\n\n" + "\n".join(lines),
         parse_mode="HTML",
@@ -3134,6 +3190,118 @@ async def warnstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/warnstatus — for everyone: check whether warn issuing is currently paused."""
     await maybe_set_group_chat(update)
     await update.message.reply_text(warns_pause_status_text())
+
+
+def _find_registered_user(rows: List[Tuple[int, str, str]], target: str) -> Optional[Tuple[int, str, str]]:
+    """Find a registered user by @username or by LeetCode nick."""
+    if target.startswith("@"):
+        t = target.lower()
+        for tid, uname, nick in rows:
+            if mention(uname).lower() == t:
+                return int(tid), uname, nick
+        return None
+    for tid, uname, nick in rows:
+        if str(nick).lower() == target.lower():
+            return int(tid), uname, nick
+    return None
+
+
+async def freeze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /freeze @user — admin-only: send a user to "отставка". The bot stops tracking them:
+    no LeetCode checks, no tags in reminders/reports, no new warns and no kick.
+    Existing warns, points and stats are kept. /freeze without args lists frozen users.
+    """
+    await maybe_set_group_chat(update)
+    if not await _is_admin(update, context):
+        await update.message.reply_text("⛔ Эта команда только для админа.")
+        return
+
+    rows = await prune_inactive_users(context, membership_chat_id_from_update(update), list_users(), "freeze")
+    if not context.args:
+        frozen = get_frozen_users()
+        frozen_lines = [
+            f"🧊 {profile_label(uname)} — с {frozen[int(tid)]}"
+            for tid, uname, _nick in sorted(rows, key=lambda r: (r[1] or "").lower())
+            if int(tid) in frozen
+        ]
+        if not frozen_lines:
+            text = "В отставке никого нет.\n\nИспользование: /freeze @username  ИЛИ  /freeze <leetcode_nick>"
+        else:
+            text = "🧊 В отставке:\n" + "\n".join(frozen_lines) + "\n\nВернуть: /unfreeze @username"
+        await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text("Использование: /freeze @username  ИЛИ  /freeze <leetcode_nick>")
+        return
+
+    found = _find_registered_user(rows, context.args[0].strip())
+    if found is None:
+        await update.message.reply_text("Не нашёл пользователя в базе.")
+        return
+
+    tid, uname, _nick = found
+    name = profile_label(uname)
+    frozen = get_frozen_users()
+    if tid in frozen:
+        await update.message.reply_text(
+            f"🧊 {name} уже в отставке (с {frozen[tid]}).",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    set_user_frozen(tid, True)
+    await auto_backup(context, "freeze")
+    warn_count = get_warn_counts([tid]).get(tid, 0)
+    await update.message.reply_text(
+        f"🧊 {name} отправлен в отставку.\n"
+        "Бот больше не проверяет его задачи, не тэгает и не выдаёт warn'ы — kick ему не грозит.\n"
+        f"Текущие warn'ы ({warn_count}/3), баллы и статистика сохранены.\n"
+        f"Вернуть: /unfreeze {html_text(mention(uname))}",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+async def unfreeze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unfreeze @user — admin-only: bring a user back from "отставка", the bot tracks them again."""
+    await maybe_set_group_chat(update)
+    if not await _is_admin(update, context):
+        await update.message.reply_text("⛔ Эта команда только для админа.")
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text("Использование: /unfreeze @username  ИЛИ  /unfreeze <leetcode_nick>")
+        return
+
+    rows = await prune_inactive_users(context, membership_chat_id_from_update(update), list_users(), "unfreeze")
+    found = _find_registered_user(rows, context.args[0].strip())
+    if found is None:
+        await update.message.reply_text("Не нашёл пользователя в базе.")
+        return
+
+    tid, uname, _nick = found
+    name = profile_label(uname)
+    if tid not in get_frozen_users():
+        await update.message.reply_text(
+            f"{name} и так не в отставке — бот за ним следит.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    set_user_frozen(tid, False)
+    await auto_backup(context, "unfreeze")
+    warn_count = get_warn_counts([tid]).get(tid, 0)
+    await update.message.reply_text(
+        f"🔥 {name} вернулся из отставки!\n"
+        "С сегодняшнего дня снова нужна минимум 1 задача в день — сегодняшний итог дня уже учитывается.\n"
+        f"Текущие warn'ы: {warn_count}/3.",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 async def tagunregistered(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3351,7 +3519,7 @@ async def refresh_current_day_snapshots_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = int(chat_id_raw)
-    rows = await prune_inactive_users(context, chat_id, list_users(), "snapshot_refresh")
+    rows = exclude_frozen(await prune_inactive_users(context, chat_id, list_users(), "snapshot_refresh"))
     if not rows:
         return
 
@@ -3383,7 +3551,7 @@ async def evening_status_job(context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = int(chat_id_raw)
 
-    rows = await prune_inactive_users(context, chat_id, list_users(), "evening_status")
+    rows = exclude_frozen(await prune_inactive_users(context, chat_id, list_users(), "evening_status"))
     if not rows:
         logger.info("Evening status skipped: no users registered")
         return
@@ -3437,7 +3605,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = int(chat_id_raw)
 
-    rows = await prune_inactive_users(context, chat_id, list_users(), "reminder")
+    rows = exclude_frozen(await prune_inactive_users(context, chat_id, list_users(), "reminder"))
     if not rows:
         logger.info("Reminder skipped: no users registered")
         return
@@ -3503,7 +3671,7 @@ async def daily_report_job(
         return
     chat_id = int(chat_id)
 
-    rows = await prune_inactive_users(context, chat_id, list_users(), "daily_report")
+    rows = exclude_frozen(await prune_inactive_users(context, chat_id, list_users(), "daily_report"))
     if not rows:
         await send_report_message(context, chat_id, "Сегодня никого не было в списке 😄")
         return
@@ -3625,7 +3793,10 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /unwarn @user — сбросить предупреждения одному участнику\n"
         "• /unwarn all — сбросить предупреждения всем\n"
         "• /pausewarns [45m|3h|1d] — временно остановить выдачу warn'ов (без срока — до /resumewarns)\n"
-        "• /resumewarns — снова включить выдачу warn'ов\n\n"
+        "• /resumewarns — снова включить выдачу warn'ов\n"
+        "• /freeze @user — отправить участника в отставку: бот его не проверяет, не тэгает, не варнит и не кикает\n"
+        "• /unfreeze @user — вернуть участника из отставки\n"
+        "• /freeze — список тех, кто в отставке\n\n"
         "*Авто-логика:*\n"
         "📋 В 18:00 бот отправляет общий статус\n"
         "⏰ В 23:00 бот тэгнет тех, кто ещё не решил ни одной задачи\n"
@@ -3738,6 +3909,8 @@ def main():
     app.add_handler(CommandHandler("pausewarns", pausewarns_cmd))  # admin-only
     app.add_handler(CommandHandler("resumewarns", resumewarns_cmd))  # admin-only
     app.add_handler(CommandHandler("warnstatus", warnstatus_cmd))
+    app.add_handler(CommandHandler("freeze", freeze_cmd))  # admin-only
+    app.add_handler(CommandHandler("unfreeze", unfreeze_cmd))  # admin-only
     app.add_handler(CommandHandler("remindnow", remindnow_cmd))  # admin-only: manual one-off reminder
     app.add_handler(CommandHandler("tagunregistered", tagunregistered))  # hidden admin-only
     app.add_handler(CommandHandler("info", info))

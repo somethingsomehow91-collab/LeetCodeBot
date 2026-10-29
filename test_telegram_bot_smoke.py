@@ -227,5 +227,234 @@ class TelegramBotDbSmokeTest(unittest.TestCase):
         self.assertEqual(sorted(fake_bot.calls), [(-100, 1), (-100, 2)])
 
 
+class FakeGroupBot:
+    """Records what the bot would do in Telegram; everyone is a group member unless listed in `left`."""
+
+    def __init__(self, left=()):
+        self.left = set(left)
+        self.sent = []
+        self.banned = []
+
+    async def get_chat_member(self, chat_id, user_id):
+        return SimpleNamespace(status="left" if user_id in self.left else "member")
+
+    async def send_message(self, chat_id, text, **kwargs):
+        self.sent.append(text)
+
+    async def send_document(self, *args, **kwargs):
+        pass
+
+    async def ban_chat_member(self, chat_id, user_id):
+        self.banned.append(user_id)
+
+    async def unban_chat_member(self, chat_id, user_id):
+        pass
+
+
+class FakeMessage:
+    def __init__(self):
+        self.replies = []
+
+    async def reply_text(self, text, **kwargs):
+        self.replies.append(text)
+
+
+class FreezeTest(unittest.TestCase):
+    ADMIN = 900
+    CHAT = -100
+
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(prefix="leetcode_bot_test_", suffix=".db")
+        os.close(fd)
+        os.unlink(self.db_path)
+        os.environ["DB_PATH"] = self.db_path
+        os.environ["DATABASE_URL"] = ""
+        sys.modules.pop("telegram_bot", None)
+        self.bot = importlib.import_module("telegram_bot")
+        self.bot.ADMIN_IDS = {self.ADMIN}
+        self.bot.AUTO_BACKUP_ENABLED = False
+        self.bot._membership_cache.clear()
+        self.bot.init_db()
+        self.bot.db_set_config("report_chat_id", str(self.CHAT))
+        self.bot.add_user(1, "alice", "alice_lc")
+        self.bot.add_user(2, "bob", "bob_lc")
+        self.today = datetime.now(self.bot.TZ).strftime("%Y-%m-%d")
+
+    def tearDown(self):
+        sys.modules.pop("telegram_bot", None)
+        try:
+            os.remove(self.db_path)
+        except FileNotFoundError:
+            pass
+
+    def run_cmd(self, handler, args, user_id=ADMIN):
+        message = FakeMessage()
+        update = SimpleNamespace(
+            message=message,
+            effective_chat=SimpleNamespace(id=1, type="private"),
+            effective_user=SimpleNamespace(id=user_id, username="admin", full_name="Admin", is_bot=False),
+        )
+        context = SimpleNamespace(args=args, bot=FakeGroupBot())
+        asyncio.run(handler(update, context))
+        return message.replies
+
+    def solved_nothing(self):
+        """Patch LeetCode so nobody solved anything today."""
+        async def no_titles(nick, day, deep_check=False):
+            return [], None
+
+        async def no_titles_for_user(tid, nick, day, deep_check=False, prefer_snapshot=False):
+            return [], None, False
+
+        self.bot.accepted_titles_on_day_async = no_titles
+        self.bot.get_titles_for_user_on_day = no_titles_for_user
+
+    def test_freeze_and_unfreeze_commands(self):
+        replies = self.run_cmd(self.bot.freeze_cmd, ["@alice"])
+        self.assertIn("отставку", replies[0])
+        self.assertEqual(self.bot.get_frozen_users(), {1: self.today})
+
+        replies = self.run_cmd(self.bot.freeze_cmd, ["@alice"])
+        self.assertIn("уже в отставке", replies[0])
+
+        replies = self.run_cmd(self.bot.freeze_cmd, [])
+        self.assertIn("alice", replies[0])
+        self.assertNotIn("bob", replies[0])
+
+        replies = self.run_cmd(self.bot.unfreeze_cmd, ["alice_lc"])  # by LeetCode nick
+        self.assertIn("вернулся", replies[0])
+        self.assertEqual(self.bot.get_frozen_users(), {})
+
+        replies = self.run_cmd(self.bot.unfreeze_cmd, ["@alice"])
+        self.assertIn("и так не в отставке", replies[0])
+
+        replies = self.run_cmd(self.bot.freeze_cmd, ["@nobody"])
+        self.assertIn("Не нашёл", replies[0])
+
+    def test_freeze_is_admin_only(self):
+        replies = self.run_cmd(self.bot.freeze_cmd, ["@alice"], user_id=1)
+        self.assertIn("только для админа", replies[0])
+        self.assertEqual(self.bot.get_frozen_users(), {})
+
+        self.bot.set_user_frozen(1, True)
+        replies = self.run_cmd(self.bot.unfreeze_cmd, ["@alice"], user_id=1)
+        self.assertIn("только для админа", replies[0])
+        self.assertEqual(self.bot.get_frozen_users(), {1: self.today})
+
+    def test_daily_report_does_not_warn_or_kick_frozen_user(self):
+        self.solved_nothing()
+        self.bot.set_warn_count(1, 2)  # alice is one miss away from a kick
+        self.bot.set_warn_count(2, 2)
+        self.bot.set_user_frozen(1, True)
+
+        fake_bot = FakeGroupBot()
+        asyncio.run(self.bot.daily_report_job(SimpleNamespace(bot=fake_bot)))
+
+        # alice keeps 2/3; bob hit 3/3, got kicked, and remove_user() wiped his warns
+        self.assertEqual(self.bot.get_warn_counts([1, 2]), {1: 2})
+        self.assertEqual(fake_bot.banned, [2])
+        report = fake_bot.sent[0]
+        self.assertNotIn("alice", report)
+        self.assertIn("bob", report)
+        self.assertIn("warn 3/3 ❌ KICK", report)
+        # alice stays registered with her stats; bob was kicked and removed
+        self.assertEqual([int(r[0]) for r in self.bot.list_users()], [1])
+
+    def test_daily_report_warns_user_again_after_unfreeze(self):
+        self.solved_nothing()
+        self.bot.set_user_frozen(1, True)
+        self.bot.set_user_frozen(1, False)
+
+        asyncio.run(self.bot.daily_report_job(SimpleNamespace(bot=FakeGroupBot())))
+
+        self.assertEqual(self.bot.get_warn_counts([1, 2]), {1: 1, 2: 1})
+
+    def test_reminder_and_evening_status_skip_frozen_user(self):
+        self.solved_nothing()
+        self.bot.set_user_frozen(1, True)
+
+        fake_bot = FakeGroupBot()
+        context = SimpleNamespace(bot=fake_bot)
+        asyncio.run(self.bot.reminder_job(context))
+        asyncio.run(self.bot.evening_status_job(context))
+
+        self.assertEqual(len(fake_bot.sent), 2)
+        for text in fake_bot.sent:
+            self.assertNotIn("alice", text)
+            self.assertIn("bob", text)
+
+    def test_reminder_celebrates_when_only_frozen_users_have_zero(self):
+        async def titles_for_user(tid, nick, day, deep_check=False, prefer_snapshot=False):
+            if tid == 2:
+                return [self.bot._encode_task_entry("EASY", "Two Sum", "two-sum")], None, True
+            return [], None, True
+
+        self.bot.get_titles_for_user_on_day = titles_for_user
+        self.bot.set_user_frozen(1, True)
+
+        fake_bot = FakeGroupBot()
+        asyncio.run(self.bot.reminder_job(SimpleNamespace(bot=fake_bot)))
+
+        self.assertEqual(len(fake_bot.sent), 1)
+        self.assertIn("ВСЕ МОЛОДЦЫ", fake_bot.sent[0])
+
+    def test_frozen_user_who_left_group_is_not_pruned(self):
+        self.bot.set_user_frozen(1, True)
+        fake_bot = FakeGroupBot(left={1, 2})
+
+        rows = asyncio.run(
+            self.bot.prune_inactive_users(SimpleNamespace(bot=fake_bot), self.CHAT, self.bot.list_users(), "test")
+        )
+
+        self.assertEqual([int(r[0]) for r in rows], [1])
+        self.assertEqual([int(r[0]) for r in self.bot.list_users()], [1])
+
+    def test_list_shows_frozen_separately_and_warns_marks_them(self):
+        self.bot.set_user_frozen(1, True)
+        self.bot.refresh_day_snapshots = lambda rows, day: asyncio.sleep(0, result=(0, 0))
+
+        text = self.run_cmd(self.bot.listcmd, [], user_id=2)[0]
+        status_part, frozen_part = text.split("🧊 В отставке:")
+        self.assertNotIn("alice", status_part)
+        self.assertIn("bob", status_part)
+        self.assertIn("alice", frozen_part)
+
+        warns_text = self.run_cmd(self.bot.warns, [], user_id=2)[0]
+        alice_line = next(ln for ln in warns_text.splitlines() if "alice" in ln)
+        bob_line = next(ln for ln in warns_text.splitlines() if "bob" in ln)
+        self.assertIn("в отставке", alice_line)
+        self.assertNotIn("в отставке", bob_line)
+
+    def test_backup_includes_freeze_state(self):
+        self.bot.set_user_frozen(1, True)
+
+        backup = self.bot.collect_backup_data()["tables"]["users"]
+        by_id = {row["telegram_id"]: row for row in backup}
+        self.assertEqual(by_id[1]["frozen_since"], self.today)
+        self.assertIsNone(by_id[2]["frozen_since"])
+
+    def test_migrates_v6_users_table_without_losing_rows(self):
+        sys.modules.pop("telegram_bot", None)
+        os.remove(self.db_path)
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)")
+        cur.execute("CREATE TABLE users (telegram_id BIGINT PRIMARY KEY, username TEXT, leetcode_nick TEXT)")
+        cur.execute("INSERT INTO config(key, value) VALUES('db_schema_version', '6')")
+        cur.execute("INSERT INTO users VALUES(7, 'carol', 'carol_lc')")
+        conn.commit()
+        conn.close()
+
+        self.bot = importlib.import_module("telegram_bot")
+        self.bot.init_db()
+
+        self.assertEqual(self.bot.db_get_config("db_schema_version"), "7")
+        self.assertEqual([tuple(r) for r in self.bot.list_users()], [(7, "carol", "carol_lc")])
+        self.assertEqual(self.bot.get_frozen_users(), {})
+        self.bot.set_user_frozen(7, True)
+        self.assertIn(7, self.bot.get_frozen_users())
+
+
 if __name__ == "__main__":
     unittest.main()
